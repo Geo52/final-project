@@ -1,11 +1,17 @@
-mod task;
+mod dispatcher;
 mod generator;
+mod metrics;
+mod task;
+mod worker;
 
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
 
 use generator::WorkloadConfig;
+use metrics::Metrics;
 
+const NUM_WORKERS: usize = 8;
 const NUM_TASKS: u64 = 600;
 const SEED: u64 = 42;
 
@@ -15,46 +21,58 @@ fn main() {
 
     let config = match experiment {
         "stressed" => {
-            println!("Experiment: Stressed workload (85% CPU, burst arrivals)");
+            println!("Experiment : Stressed workload (85% CPU, burst arrivals)");
             WorkloadConfig::stressed(NUM_TASKS, SEED)
         }
         _ => {
-            println!("Experiment: Balanced workload (50% CPU / 50% IO, uniform arrivals)");
+            println!("Experiment : Balanced workload (50/50 CPU-IO, uniform arrivals)");
             WorkloadConfig::balanced(NUM_TASKS, SEED)
         }
     };
 
-    println!("Generating {} tasks (seed={SEED})...\n", config.num_tasks);
+    println!("Workers    : {NUM_WORKERS}");
+    println!("Tasks      : {NUM_TASKS}");
+    println!("Policy     : priority-based with aging");
+    println!();
 
-    let (tx, rx) = mpsc::channel();
+    // Metrics is written by the dispatcher and read by main after all threads join.
+    let metrics = Arc::new(Mutex::new(Metrics::new(NUM_WORKERS)));
+    let metrics_d = Arc::clone(&metrics);
 
-    let gen_handle = thread::spawn(move || generator::run(tx, config));
+    // Channel: generator → dispatcher
+    let (gen_tx, gen_rx) = mpsc::channel::<task::Task>();
 
-    // For now: collect and print a sample to verify generation works.
-    let mut cpu_count = 0u64;
-    let mut io_count = 0u64;
-    let mut tasks = Vec::new();
+    // Channel: workers → dispatcher (one shared sender, cloned per worker)
+    let (comp_tx, comp_rx) = mpsc::channel::<metrics::CompletionReport>();
 
-    while let Ok(task) = rx.recv() {
-        match task.kind {
-            task::TaskKind::Cpu => cpu_count += 1,
-            task::TaskKind::Io  => io_count  += 1,
-        }
-        tasks.push(task);
+    // Per-worker channels: dispatcher → worker i
+    let mut worker_txs = Vec::with_capacity(NUM_WORKERS);
+    let mut worker_handles = Vec::with_capacity(NUM_WORKERS);
+
+    for id in 0..NUM_WORKERS {
+        let (wtx, wrx) = mpsc::channel::<Option<task::Task>>();
+        worker_txs.push(wtx);
+        let ctxc = comp_tx.clone();
+        worker_handles.push(thread::spawn(move || worker::run(id, wrx, ctxc)));
     }
+    // The original comp_tx must be dropped so the channel closes when all workers exit.
+    drop(comp_tx);
 
+    // Dispatcher thread: owns both queues, drives the scheduling loop.
+    let dispatch_handle = thread::spawn(move || {
+        dispatcher::run(gen_rx, comp_rx, worker_txs, metrics_d);
+    });
+
+    // Generator thread: sends tasks in arrival-time order, then drops its sender.
+    let gen_handle = thread::spawn(move || generator::run(gen_tx, config));
+
+    // Join in natural order: generator first (it drives everything else).
     gen_handle.join().expect("generator panicked");
-
-    println!("Tasks received : {}", tasks.len());
-    println!("  CPU          : {cpu_count}");
-    println!("  IO           : {io_count}");
-
-    // Print the first 10 tasks as a sanity check.
-    println!("\nFirst 10 tasks:");
-    for t in tasks.iter().take(10) {
-        println!(
-            "  id={:3}  kind={}  duration={:3}ms  priority={}",
-            t.id, t.kind, t.duration_ms, t.priority
-        );
+    dispatch_handle.join().expect("dispatcher panicked");
+    for h in worker_handles {
+        h.join().expect("worker panicked");
     }
+
+    println!("=== Results ===");
+    metrics.lock().unwrap().print_summary();
 }
