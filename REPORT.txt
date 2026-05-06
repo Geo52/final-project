@@ -1,0 +1,150 @@
+Design Report: Concurrent Task Dispatcher
+==========================================
+
+
+Overview
+--------
+
+This project implements a concurrent task dispatcher in Rust that simulates an
+operating-system-style scheduler. A generator thread produces a stream of CPU-bound
+and IO-bound tasks, a dispatcher thread routes them through two typed queues, and a
+bounded pool of eight worker threads executes them according to a priority-based
+scheduling policy with aging. The design emphasizes clear thread roles, minimal
+shared state, and a correct termination sequence.
+
+
+Threads and Major Components
+-----------------------------
+
+Five kinds of threads run concurrently, each with one responsibility. The generator
+pre-computes 600 task arrival times from a fixed seed, sleeps until each task is
+due, and sends it down a channel. Dropping the sender at the end is the shutdown
+signal. The dispatcher owns both queues outright — no lock is needed because no
+other thread touches them. Each iteration it ingests new tasks from the generator
+channel, collects completion reports from workers, and dispatches tasks to idle
+workers. Eight worker threads each block on a personal channel waiting for work.
+CPU tasks run as a busy-wait spin to consume real CPU time; IO tasks call
+thread::sleep to simulate blocking IO. Workers send a CompletionReport back on
+completion and exit when they receive None. A monitor thread reads a shared atomic
+counter every 500 milliseconds and prints live progress without acquiring any lock.
+Main joins all threads in order — generator, dispatcher, workers, monitor — then
+prints the final summary.
+
+
+Shared State and Synchronization
+----------------------------------
+
+The two task queues are plain Vec<Task> values owned solely by the dispatcher, so
+they need no synchronization at all. The only Mutex in the system wraps the Metrics
+struct, which the dispatcher writes on every completion and main reads after all
+threads have joined. The live completion counter is an AtomicUsize shared between
+the dispatcher (writer) and the monitor (reader); relaxed ordering is sufficient
+because an approximate progress count is acceptable. A stop flag implemented as an
+AtomicBool lets main signal the monitor to exit after everything else is joined.
+
+Channels carry all task and completion traffic. The generator-to-dispatcher channel
+decouples production and consumption rates and doubles as a shutdown notification
+when the sender drops. Each worker has its own dispatcher-to-worker channel so the
+dispatcher can target a specific idle worker — this is what makes the
+reserved-worker policy possible. All eight workers share a single
+workers-to-dispatcher channel using mpsc, giving the dispatcher one place to check
+for completions rather than polling eight channels separately.
+
+
+Scheduling Policy
+------------------
+
+The system uses priority-based scheduling with aging. Each task is assigned a
+random base priority from 1 to 10 at generation time. When the dispatcher selects
+the next task it computes an effective priority for every queued task:
+
+    effective_priority = base_priority + (milliseconds_waited / 50)
+
+The task with the highest effective priority across both queues is dispatched next.
+Aging — one extra priority point per 50 milliseconds of waiting — prevents
+starvation. Without it, a continuous arrival of high-priority tasks could bury a
+low-priority task indefinitely. With it, any waiting task will eventually outrank
+even a freshly arrived priority-10 task.
+
+An optional reserved-worker extension adds a second layer. Workers 0 and 1 only
+pull from the CPU queue; workers 2 through 7 pull from whichever queue holds the
+highest-priority task. Critically, the dispatcher selects a task only after knowing
+which worker it is dispatching to. This required restructuring the dispatch loop to
+drain all idle workers into a snapshot, attempt to assign each one a task, and
+requeue any worker for which no suitable task was available.
+
+This policy improved fairness meaningfully in the stressed workload. Reserving two
+workers for CPU tasks guaranteed IO tasks always had access to at least six general
+workers, cutting the CPU-versus-IO fairness gap from 30 milliseconds to 8
+milliseconds — a 73 percent improvement — with no change in makespan. The trade-off
+is that reserved workers sit idle whenever the CPU queue is empty, wasting capacity
+in IO-heavy workloads. The reservation is also static; it cannot adapt at runtime
+if the workload character changes.
+
+
+A Concurrency Bug Encountered During Development
+-------------------------------------------------
+
+The original termination condition was:
+
+    if gen_done && cpu_queue.is_empty() && io_queue.is_empty() && idle.is_empty()
+
+The reasoning was that if no workers were idle they must all be busy finishing their
+last tasks. This is wrong. idle.is_empty() is true the moment the dispatcher hands
+out the last batch of tasks — before any of those workers has sent a completion
+report back. The dispatcher would break out of its loop early, close the completion
+channel, and lose every in-flight report. Final metrics would be short by however
+many tasks were executing at that moment.
+
+The fix was to change the condition to idle.len() == num_workers. This is only true
+when every worker has completed its task, sent a report, and been moved back into
+the idle set by the dispatcher. It is the correct quiescence condition: all work is
+done, not merely all work dispatched.
+
+
+Where Starvation Could Still Happen
+-------------------------------------
+
+The aging policy does not eliminate all unfairness. If all six general workers
+simultaneously pick up long CPU tasks, IO tasks must wait the full duration of
+those tasks regardless of how high their effective priority has grown. In the
+stressed experiment, average wait times exceeded 1.2 seconds and the maximum
+reached 2.4 seconds even with reserved workers in place. Additionally, the aging
+divisor of 50 milliseconds was tuned for durations in the 5 to 60 millisecond
+range. A workload with longer tasks would need a larger divisor, and a workload
+with very short tasks would need a smaller one. Finally, reserved workers become a
+liability rather than a benefit if the workload shifts to being mostly IO-bound,
+since the two CPU-reserved workers sit idle while IO tasks queue behind the six
+general workers.
+
+
+Experiment Results
+-------------------
+
+Two workloads were tested. The balanced workload (50 percent CPU, 50 percent IO,
+durations 5-20 ms, arrivals spread over 2 seconds) was straightforward for eight
+workers. Makespan was 2001 ms, average wait was effectively 0 ms, utilization was
+46 percent, and the fairness gap between task types was 0 ms. Workers were rarely
+all busy simultaneously.
+
+The stressed workload (85 percent CPU, durations 10-60 ms, 70 percent of tasks
+arriving in the first 80 ms) immediately saturated all workers. Under the pure
+priority policy, makespan was 2733 ms, average wait was 1248 ms, max wait was 2433
+ms, utilization was 97 percent, and the fairness gap was 30 ms. Switching to the
+reserved policy produced nearly identical throughput numbers but cut the fairness
+gap to 8 ms, confirming that the reservation effectively protected IO tasks from
+being crowded out during a CPU burst.
+
+
+Lessons Learned
+----------------
+
+The most important lesson was that "all queues empty" is not the same as "all work
+done." Work in flight must be tracked through completion, not just through
+dispatch, and the termination condition must reflect that. The second lesson was
+that the worker's identity and the task selection are coupled decisions when workers
+have types — the dispatch loop must be structured accordingly. The third was that
+the right synchronization primitive depends on the access pattern: the queues needed
+no lock, the metrics needed a mutex, and the progress counter needed only an atomic.
+Reaching for a mutex everywhere by default would have added complexity without
+adding safety.
