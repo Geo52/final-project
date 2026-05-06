@@ -3,37 +3,23 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::metrics::CompletionReport;
-use crate::task::{Task, TaskKind};
+use crate::task::{Task, TASK_DURATION_MS};
 
-/// Runs in its own thread. Blocks on its channel waiting for tasks.
-/// Receives `None` as the shutdown signal and then exits cleanly.
+/// Blocks waiting for tasks. Both CPU and IO tasks sleep TASK_DURATION_MS to
+/// simulate execution time; the distinction is the cpu_percent they carry,
+/// which the manager uses to enforce the global CPU cap.
 pub fn run(id: usize, rx: Receiver<Option<Task>>, comp_tx: Sender<CompletionReport>) {
     loop {
         match rx.recv() {
             Ok(Some(task)) => {
                 let start_time = Instant::now();
-
-                match task.kind {
-                    TaskKind::Cpu => {
-                        // Simulate CPU-bound work: spin so we actually consume CPU time.
-                        let deadline = start_time + Duration::from_millis(task.duration_ms);
-                        let mut x = 0u64;
-                        while Instant::now() < deadline {
-                            x = x.wrapping_add(1);
-                        }
-                        let _ = x;
-                    }
-                    TaskKind::Io => {
-                        // Simulate IO-bound work: block the thread as real IO would.
-                        thread::sleep(Duration::from_millis(task.duration_ms));
-                    }
-                }
-
+                thread::sleep(Duration::from_millis(TASK_DURATION_MS));
                 let end_time = Instant::now();
+
                 let report = CompletionReport {
-                    task_id: task.id,
-                    worker_id: id,
-                    kind: task.kind,
+                    task_id:      task.id,
+                    worker_id:    id,
+                    kind:         task.kind,
                     arrival_time: task.arrival_time,
                     start_time,
                     end_time,
@@ -42,7 +28,7 @@ pub fn run(id: usize, rx: Receiver<Option<Task>>, comp_tx: Sender<CompletionRepo
                     break;
                 }
             }
-            Ok(None) | Err(_) => break, // None = shutdown signal; Err = dispatcher gone
+            Ok(None) | Err(_) => break,
         }
     }
 }

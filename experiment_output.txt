@@ -1,0 +1,31 @@
+╔══════════════════════════════════════════════╗
+║       Concurrent Task Dispatcher             ║
+╚══════════════════════════════════════════════╝
+Workload   : 70% IO / 30% CPU  |  1000 tasks, 20 ms intervals
+Workers    : 8
+Task times : CPU = 35% load, IO = 10% load, both run 200 ms
+CPU cap    : 100%  (manager blocks dispatch if cap would be exceeded)
+
+Running Simulation 1 — FIFO...
+
+Running Simulation 2 — Optimized...
+
+--- Simulation 1 — FIFO ---
+Total tasks completed : 1000  (CPU 299 / IO 701)
+Total runtime         : 39210 ms
+Avg wait time         : 9206 ms
+Avg turnaround time   : 9406 ms
+Avg CPU usage         : 89%  (peak 100%)
+Avg active workers    : 5 / 8
+
+--- Simulation 2 — Optimized ---
+Total tasks completed : 1000  (CPU 299 / IO 701)
+Total runtime         : 41910 ms
+Avg wait time         : 5452 ms
+Avg turnaround time   : 5652 ms
+Avg CPU usage         : 83%  (peak 100%)
+Avg active workers    : 4 / 8
+
+=== Comparison ===
+Runtime    : FIFO 39210 ms  vs  Optimized 41910 ms  (0.94x speedup)
+Avg CPU    : FIFO 89%  vs  Optimized 83%

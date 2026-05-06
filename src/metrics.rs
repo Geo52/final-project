@@ -1,113 +1,103 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::time::Instant;
 
 use crate::task::TaskKind;
 
-/// Sent from a worker to the dispatcher when a task finishes.
 pub struct CompletionReport {
-    pub task_id: u64,
-    pub worker_id: usize,
-    pub kind: TaskKind,
+    #[allow(dead_code)]
+    pub task_id:      u64,
+    pub worker_id:    usize,
+    pub kind:         TaskKind,
     pub arrival_time: Instant,
-    pub start_time: Instant,
-    pub end_time: Instant,
+    pub start_time:   Instant,
+    pub end_time:     Instant,
 }
 
-/// Accumulates per-task completion data.
-/// Written exclusively by the dispatcher thread; read by main after all threads join.
+/// Snapshot recorded by the monitor thread every 10 ms.
+pub struct MonitorSample {
+    pub cpu_percent:     u32,
+    pub active_workers:  usize,
+}
+
 pub struct Metrics {
-    reports: Vec<CompletionReport>,
-    worker_busy_ms: Vec<u64>,
-    run_start: Instant,
-    run_end: Option<Instant>,
-    /// Shared with the monitor thread so it can print live progress without locking.
-    pub counter: Arc<AtomicUsize>,
+    pub reports:     Vec<CompletionReport>,
+    pub samples:     Vec<MonitorSample>,  // from monitor thread
+    run_start:       Instant,
+    run_end:         Option<Instant>,
 }
 
 impl Metrics {
-    pub fn new(num_workers: usize, counter: Arc<AtomicUsize>) -> Self {
+    pub fn new() -> Self {
         Self {
-            reports: Vec::new(),
-            worker_busy_ms: vec![0; num_workers],
+            reports:   Vec::new(),
+            samples:   Vec::new(),
             run_start: Instant::now(),
-            run_end: None,
-            counter,
+            run_end:   None,
         }
     }
 
     pub fn record(&mut self, report: CompletionReport) {
-        let busy = report.end_time.duration_since(report.start_time).as_millis() as u64;
-        self.worker_busy_ms[report.worker_id] += busy;
-        self.counter.fetch_add(1, Ordering::Relaxed);
         self.reports.push(report);
+    }
+
+    pub fn add_sample(&mut self, sample: MonitorSample) {
+        self.samples.push(sample);
     }
 
     pub fn finalize(&mut self) {
         self.run_end = Some(Instant::now());
     }
 
-    pub fn print_summary(&self) {
+    pub fn print_summary(&self, label: &str) {
         let total = self.reports.len();
-        if total == 0 {
-            println!("No tasks completed.");
-            return;
-        }
-
         let makespan_ms = self
             .run_end
             .unwrap_or_else(Instant::now)
             .duration_since(self.run_start)
             .as_millis() as u64;
 
-        let mut total_wait: u64 = 0;
-        let mut total_turnaround: u64 = 0;
-        let mut max_wait: u64 = 0;
-        let mut max_wait_id: u64 = 0;
-        let mut cpu_wait_sum: u64 = 0;
-        let mut io_wait_sum: u64 = 0;
-        let mut cpu_count: usize = 0;
-        let mut io_count: usize = 0;
+        let cpu_count = self.reports.iter().filter(|r| r.kind == TaskKind::Cpu).count();
+        let io_count  = self.reports.iter().filter(|r| r.kind == TaskKind::Io).count();
 
-        for r in &self.reports {
-            let wait = r.start_time.duration_since(r.arrival_time).as_millis() as u64;
-            let turnaround = r.end_time.duration_since(r.arrival_time).as_millis() as u64;
-            total_wait += wait;
-            total_turnaround += turnaround;
-            if wait > max_wait {
-                max_wait = wait;
-                max_wait_id = r.task_id;
-            }
-            match r.kind {
-                TaskKind::Cpu => { cpu_wait_sum += wait; cpu_count += 1; }
-                TaskKind::Io  => { io_wait_sum  += wait; io_count  += 1; }
-            }
-        }
+        let avg_cpu = if self.samples.is_empty() { 0 } else {
+            self.samples.iter().map(|s| s.cpu_percent as u64).sum::<u64>()
+                / self.samples.len() as u64
+        };
+        let avg_workers = if self.samples.is_empty() { 0 } else {
+            self.samples.iter().map(|s| s.active_workers as u64).sum::<u64>()
+                / self.samples.len() as u64
+        };
+        let peak_cpu = self.samples.iter().map(|s| s.cpu_percent).max().unwrap_or(0);
 
-        let avg_wait       = total_wait      / total as u64;
-        let avg_turnaround = total_turnaround / total as u64;
-        let cpu_avg_wait   = if cpu_count > 0 { cpu_wait_sum / cpu_count as u64 } else { 0 };
-        let io_avg_wait    = if io_count  > 0 { io_wait_sum  / io_count  as u64 } else { 0 };
+        let avg_wait_ms = if total == 0 { 0 } else {
+            self.reports.iter()
+                .map(|r| r.start_time.duration_since(r.arrival_time).as_millis() as u64)
+                .sum::<u64>() / total as u64
+        };
+        let avg_turnaround_ms = if total == 0 { 0 } else {
+            self.reports.iter()
+                .map(|r| r.end_time.duration_since(r.arrival_time).as_millis() as u64)
+                .sum::<u64>() / total as u64
+        };
 
-        let num_workers = self.worker_busy_ms.len() as u64;
-        let capacity_ms = makespan_ms.saturating_mul(num_workers);
-        let total_busy_ms: u64 = self.worker_busy_ms.iter().sum();
-        let utilization_pct = if capacity_ms > 0 { 100 * total_busy_ms / capacity_ms } else { 0 };
+        println!("--- {label} ---");
+        println!("Total tasks completed : {total}  (CPU {cpu_count} / IO {io_count})");
+        println!("Total runtime         : {makespan_ms} ms");
+        println!("Avg wait time         : {avg_wait_ms} ms");
+        println!("Avg turnaround time   : {avg_turnaround_ms} ms");
+        println!("Avg CPU usage         : {avg_cpu}%  (peak {peak_cpu}%)");
+        println!("Avg active workers    : {avg_workers} / 8");
+    }
 
-        let fairness_gap = (cpu_avg_wait as i64 - io_avg_wait as i64).unsigned_abs();
+    pub fn total_runtime_ms(&self) -> u64 {
+        self.run_end
+            .unwrap_or_else(Instant::now)
+            .duration_since(self.run_start)
+            .as_millis() as u64
+    }
 
-        println!("=== Summary Statistics ===");
-        println!("Total tasks completed  : {total}");
-        println!("  CPU tasks            : {cpu_count}");
-        println!("  IO  tasks            : {io_count}");
-        println!("Makespan               : {makespan_ms} ms");
-        println!("Avg wait time          : {avg_wait} ms");
-        println!("Avg turnaround time    : {avg_turnaround} ms");
-        println!("Max wait time          : {max_wait} ms  (task {max_wait_id})");
-        println!("Worker utilization     : {utilization_pct}%");
-        println!(
-            "Fairness gap           : {fairness_gap} ms  \
-             (CPU avg {cpu_avg_wait} ms  vs  IO avg {io_avg_wait} ms)"
-        );
+    pub fn avg_cpu(&self) -> u64 {
+        if self.samples.is_empty() { return 0; }
+        self.samples.iter().map(|s| s.cpu_percent as u64).sum::<u64>()
+            / self.samples.len() as u64
     }
 }
