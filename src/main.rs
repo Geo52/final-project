@@ -107,9 +107,6 @@ fn main() {
         ),
     };
 
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║       Concurrent Task Dispatcher             ║");
-    println!("╚══════════════════════════════════════════════╝");
     println!("Workload   : {workload_label}  |  1000 tasks, 20 ms intervals");
     println!("Workers    : {NUM_WORKERS}");
     println!("Task times : CPU = 35% load, IO = 10% load, both run 200 ms");
