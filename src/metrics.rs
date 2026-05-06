@@ -12,12 +12,13 @@ pub struct CompletionReport {
     pub end_time: Instant,
 }
 
-/// Accumulates completion data. Written by the dispatcher, read by main after all threads join.
+/// Accumulates per-task completion data.
+/// Written exclusively by the dispatcher thread; read by main after all threads join.
 pub struct Metrics {
-    pub reports: Vec<CompletionReport>,
-    pub worker_busy_ms: Vec<u64>,
-    pub run_start: Instant,
-    pub run_end: Option<Instant>,
+    reports: Vec<CompletionReport>,
+    worker_busy_ms: Vec<u64>,
+    run_start: Instant,
+    run_end: Option<Instant>,
 }
 
 impl Metrics {
@@ -42,18 +43,68 @@ impl Metrics {
 
     pub fn print_summary(&self) {
         let total = self.reports.len();
-        println!("Tasks completed : {total}");
-
-        let cpu = self.reports.iter().filter(|r| r.kind == TaskKind::Cpu).count();
-        let io = self.reports.iter().filter(|r| r.kind == TaskKind::Io).count();
-        println!("  CPU           : {cpu}");
-        println!("  IO            : {io}");
+        if total == 0 {
+            println!("No tasks completed.");
+            return;
+        }
 
         let makespan_ms = self
             .run_end
             .unwrap_or_else(Instant::now)
             .duration_since(self.run_start)
-            .as_millis();
-        println!("Makespan        : {makespan_ms} ms");
+            .as_millis() as u64;
+
+        // Per-task timing
+        let mut total_wait: u64 = 0;
+        let mut total_turnaround: u64 = 0;
+        let mut max_wait: u64 = 0;
+        let mut max_wait_id: u64 = 0;
+        let mut cpu_wait_sum: u64 = 0;
+        let mut io_wait_sum: u64 = 0;
+        let mut cpu_count: usize = 0;
+        let mut io_count: usize = 0;
+
+        for r in &self.reports {
+            let wait = r.start_time.duration_since(r.arrival_time).as_millis() as u64;
+            let turnaround = r.end_time.duration_since(r.arrival_time).as_millis() as u64;
+            total_wait += wait;
+            total_turnaround += turnaround;
+            if wait > max_wait {
+                max_wait = wait;
+                max_wait_id = r.task_id;
+            }
+            match r.kind {
+                TaskKind::Cpu => { cpu_wait_sum += wait; cpu_count += 1; }
+                TaskKind::Io  => { io_wait_sum  += wait; io_count  += 1; }
+            }
+        }
+
+        let avg_wait       = total_wait      / total as u64;
+        let avg_turnaround = total_turnaround / total as u64;
+        let cpu_avg_wait   = if cpu_count > 0 { cpu_wait_sum / cpu_count as u64 } else { 0 };
+        let io_avg_wait    = if io_count  > 0 { io_wait_sum  / io_count  as u64 } else { 0 };
+
+        // Worker utilization: total busy time / (makespan × num_workers)
+        let num_workers = self.worker_busy_ms.len() as u64;
+        let capacity_ms = makespan_ms.saturating_mul(num_workers);
+        let total_busy_ms: u64 = self.worker_busy_ms.iter().sum();
+        let utilization_pct = if capacity_ms > 0 { 100 * total_busy_ms / capacity_ms } else { 0 };
+
+        // Fairness gap: difference in average wait between CPU and IO tasks
+        let fairness_gap = (cpu_avg_wait as i64 - io_avg_wait as i64).unsigned_abs();
+
+        println!("=== Summary Statistics ===");
+        println!("Total tasks completed  : {total}");
+        println!("  CPU tasks            : {cpu_count}");
+        println!("  IO  tasks            : {io_count}");
+        println!("Makespan               : {makespan_ms} ms");
+        println!("Avg wait time          : {avg_wait} ms");
+        println!("Avg turnaround time    : {avg_turnaround} ms");
+        println!("Max wait time          : {max_wait} ms  (task {max_wait_id})");
+        println!("Worker utilization     : {utilization_pct}%");
+        println!(
+            "Fairness gap           : {fairness_gap} ms  \
+             (CPU avg wait {cpu_avg_wait} ms  vs  IO avg wait {io_avg_wait} ms)"
+        );
     }
 }
